@@ -1,42 +1,44 @@
-# Claude 実装エージェント 行動指針
+# Claude Code 作業指針（パイプライン開発）
 
-このリポジトリでは、Claude が GitHub Issue に基づいてコードを実装し、Pull Request を作成します。
-以下の指示に必ず従ってください。
+このリポジトリは `ai-agent-pipeline` の開発・設計を行うワークスペース。
+Claude Code CLI としての私がこのドキュメントを読む。
 
-## ブランチ
+## リポジトリ構成
 
-- 作業ブランチは `impl/issue-{Issue番号}` 形式で作成する
-- `main` ブランチへの直接 push は行わない
+| リポジトリ | 役割 |
+|-----------|------|
+| `haruvv/CodingAgentv2` | このワークスペース。設計・開発の作業場 |
+| `haruvv/ai-agent-pipeline` | Reusable Workflow の定義・スクリプト管理 |
+| `haruvv/ai-agent-sandbox` | pipeline の動作確認環境 |
 
-## 実装スコープ
+## 作業方針
 
-- **Issue に記載された内容のみ** 実装する
-- Issue で指定されていないリファクタリング・整理・改善は行わない
-- 変更するファイルは最小限に留める
-- 秘密情報（APIキー・パスワード・トークン等）を生成・出力・コミットしない
+- 変更は基本的に `ai-agent-pipeline` に対して行う
+- 変更後は `ai-agent-sandbox` で動作確認する
+- pipeline の Reusable Workflow を変更したら sandbox でテストしてから完了とする
 
-## 実装手順
+## pipeline の構成
 
-1. Issue の「目的」「実装内容」「完了条件」「制約事項」を読み込む
-2. 関連ファイルを確認する
-3. Issueに作業開始のコメントを残す（例: `実装を開始します。`）
-4. ブランチを作成してコードを修正する
-5. 完了条件を満たしているか確認する
-6. コミットして Pull Request を作成する
+```
+ai-agent-pipeline/
+├── .github/workflows/
+│   ├── claude-impl-reusable.yml  # Claude実装ワークフローの本体
+│   ├── ci-reusable.yml           # CIの本体
+│   └── ci.yml                    # pipeline自身のPR用CI
+└── scripts/
+    └── setup-repo.sh             # 新リポジトリのセットアップ
+```
 
-## Pull Request
+## 新しいプロダクトリポジトリを作る手順
 
-PR には以下を含める：
-- 変更概要
-- 対応 Issue 番号（`Closes #XX`）
-- 実施内容
-- 懸念点・未対応事項（あれば）
+```bash
+gh repo create <repo-name> --public --template haruvv/ai-agent-pipeline
+bash /path/to/ai-agent-pipeline/scripts/setup-repo.sh haruvv/<repo-name>
+gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo haruvv/<repo-name>
+```
 
-PR 作成後：
-- `ai-generated` ラベルを付ける
-- `ready-for-review` ラベルを付ける
-- Issue に完了コメントを残す（例: `実装が完了しました。PR #XX をご確認ください。`）
+## 注意事項
 
-## 処理できない場合
-
-Issue の記述が不足していて実装できない場合は、Issue にコメントで不足情報を明記して処理を中断する。
+- `ai-agent-pipeline` の Reusable Workflow を変更する場合、後方互換性に注意する
+- sandbox で確認せずに pipeline の main を変更しない
+- 秘密情報（APIキー・トークン等）をコードやコミットに含めない
