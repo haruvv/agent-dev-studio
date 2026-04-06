@@ -1,188 +1,422 @@
-# AI自律開発エージェントチーム（MVP）設計書
+# AI自律開発エージェントパイプライン 設計書
 
-本書は要件定義書（`docs/requirement.md`）に基づき、自律開発パイプラインMVPの具体的な設計を定義する。
+本書は要件定義書（`docs/requirement.md`）に基づく自律開発パイプラインの設計を定義する。
 
 ---
 
 ## 1. システム全体設計
 
-### 1.1 アーキテクチャ概観
+### 1.1 設計思想
 
-全体は「要求受付層（agent-intake）」と「自律開発層（dev-agents）」の 2 層構造で構成される。
+パイプラインを「受付層」「オーケストレーション層」「実行層」の3層に分離する。
 
-要求受付層では、人間が Discord のスラッシュコマンドで自然言語の要求を入力し、agent-intake が LLM で解釈して GitHub Issue を起票する。自律開発層では、GitHub Issues / Pull Requests をステート管理の軸とし、ラベル遷移をトリガーに各エージェントが順次起動する。
+| 層 | 担当 | 主要コンポーネント |
+|---|---|---|
+| 受付層 | 人間からの要求受付・GitHub Issue起票 | agent-intake（Lambda） |
+| オーケストレーション層 | ステート管理・ジョブ発行・CI結果処理 | GitHub Actions（トリガー）/ Orchestrator |
+| 実行層 | 実際のコード実装・コミット・PR作成 | ECS Fargate Worker |
+
+**GitHub Actions はトリガーと CI に限定する。** 実装・修正などの重処理は ECS Fargate Worker に委譲する。これにより Actions のツール制限・タイムアウト・イベント発火制約を回避し、Worker 側で自由な実行環境を確保する。
+
+### 1.2 全体フロー
 
 ```
 Human
+  │ Discord /issue または /create コマンド（自然言語）
+  ▼
+agent-intake（Lambda: handler + processor）
+  │ LLM（Gemma）で自然言語を解釈
+  │ 曖昧な場合は Discord 上で確認
+  ▼
+GitHub Issue 起票
+  │ 「要件定義作成」ラベル付与
+  ▼
+GitHub Actions（ラベルイベント検知 → SQS にジョブ送信）
+  ▼
+SQS → EventBridge Pipes
+  ▼
+ECS Fargate Worker
+  ├─ 要件定義・設計・タスク分割フェーズ：
+  │    Issue 上で LLM を実行、コメント投稿・ラベル更新
+  │    次フェーズのラベルを PAT で付与 → GitHub Actionsが次ジョブを発行
   │
-  ▼ Discord /issue コマンド（自然言語）
-agent-intake（Discord Bot）
-  │  AWS Lambda（handler + processor）
-  │  LLM（Gemini / Gemma）で自然言語を解釈
-  │  曖昧な場合は Discord 上で確認
-  ▼ Issue 自動起票 + 「要件定義作成」ラベル付与
-GitHub Issues
-  │
-  ├─ 要件定義エージェント  （ラベル: 要件定義作成）
-  │    ├─ 質問あり → waiting-for-answer ラベル付与（人間の回答待ち）
-  │    └─ 要件確定 → Issue コメント + 詳細設計作成 ラベル付与
-  │
-  ├─ 設計エージェント       （ラベル: 詳細設計作成）
-  │    └─→ docs/ に設計書コミット + タスク分割 ラベル付与
-  │
-  ├─ タスク分割エージェント （ラベル: タスク分割）
-  │    └─→ 子 Issue 起票 + ready-for-impl ラベル付与
-  │
-  ├─ 実装エージェント       （ラベル: ready-for-impl）
-  │    └─→ ブランチ作成・実装・PR 作成 + ready-for-review ラベル付与
-  │
-  ├─ レビューエージェント   （ラベル: ready-for-review）
-  │    ├─ 承認 → review-passed ラベル付与
-  │    └─ 差し戻し → needs-fix ラベル付与（実装エージェントが同一 PR ブランチで修正継続）
-  │
-  ├─ 統合判定エージェント   （ラベル: review-passed）
-  │    ├─ 条件満足 → ready-to-merge ラベル付与
-  │    └─ 条件未達 → blocked ラベル付与
-  │
-  └─ 監視エージェント       （2時間ごと定期実行）
-       └─→ 停滞検知 → 再起動 or needs-human ラベル付与
+  └─ 実装フェーズ：
+       対象リポジトリをクローン
+       実装ブランチ作成
+       Claude Code でコード実装・コミット・プッシュ
+       PR 作成 + ready-for-review ラベル付与（PAT）
+  ▼
+GitHub Actions（CI: lint / test）
+  ▼
+GitHub Webhook → Orchestrator
+  ├─ CI 成功 → State DB 更新（ci-passed）→ 人間レビュー待ち
+  └─ CI 失敗 → State DB 更新（ci-failed）
+              → SQS に repair job を積む
+              → ECS Fargate Worker（修正・再コミット）
+              → CI 再実行
+              → 上限到達で needs-human エスカレーション
+  ▼
+人間レビュー → approve → マージ
 ```
 
-### 1.2 リポジトリ構成
+### 1.3 リポジトリ構成
 
-本MVPでは、要件定義・設計・ワークフロー・エージェント定義・実装コードを `dev-agents` リポジトリに集約して管理する。正式な一次情報源は `dev-agents` リポジトリとし、エージェントは当該リポジトリ内の `docs/` および `.claude/agents/` を参照して作業を行う。
+| リポジトリ | 役割 |
+|---|---|
+| `haruvv/agent-intake` | Discord Bot・Orchestrator（Lambda） |
+| `haruvv/dev-agents` | パイプライン定義テンプレート（ワークフロー・ラベル定義） |
+| `haruvv/<app-name>` | 実装先（`/create` で動的生成） |
 
-### 1.3 dev-agents リポジトリのディレクトリ構成
+`dev-agents` はテンプレートリポジトリとして機能し、`/create` 実行時にワークフロー・ラベル・Secrets が新リポジトリにコピーされる。
+
+---
+
+## 2. コンポーネント設計
+
+### 2.1 agent-intake（受付層 + Orchestrator）
+
+**リポジトリ**：`haruvv/agent-intake`
+
+#### 2.1.1 Discord Bot（Lambda 2関数構成）
+
+Discord のインタラクション受信から3秒以内の ACK が必要なため、handler と processor を分離する。
 
 ```
-dev-agents/
-├── .github/
-│   ├── workflows/              # GitHub Actions ワークフロー
-│   │   ├── claude-requirements.yml     # 要件定義エージェント
-│   │   ├── claude-design.yml           # 設計エージェント
-│   │   ├── claude-task-split.yml       # タスク分割エージェント
-│   │   ├── claude-impl.yml             # 実装エージェント
-│   │   ├── claude-review.yml           # レビューエージェント
-│   │   ├── claude-merge-check.yml      # 統合判定エージェント
-│   │   ├── stale-monitor.yml           # 監視エージェント
-│   │   └── ci.yml                      # CI
-│   ├── ISSUE_TEMPLATE/         # Issue テンプレート
-│   └── pull_request_template.md
-├── .claude/
-│   └── agents/                 # エージェント定義（Markdown）
-├── docs/                       # 設計書・要件定義・意思決定ログ（一次情報源）
-│   ├── decisions/              # 意思決定ログ
-│   └── plans/                  # 実行計画
-└── src/                        # 実装コード
+Discord POST /interactions
+  ↓
+API Gateway
+  ↓
+Lambda: handler
+  署名検証（Ed25519）
+  type 1 → PONG 即時返答
+  type 2 → type 5 ACK 即時返答 + processor を非同期起動
+  ↓
+Lambda: processor
+  Gemma で自然言語解釈
+  曖昧 → Discord に確認メッセージ返信
+  明確 → GitHub Issue 起票（「要件定義作成」ラベル付与）
+       → Discord に Issue URL を返信
+```
+
+| 関数 | 役割 | タイムアウト目安 |
+|---|---|---|
+| `agent-intake-handler` | 署名検証・即時 ACK・processor 起動 | 3秒以内 |
+| `agent-intake-processor` | LLM 解釈・Issue 起票・Discord 返信 | 最大30秒 |
+
+#### 2.1.2 Orchestrator（GitHub Webhook 処理）
+
+agent-intake に `/webhook` エンドポイントを追加し、CI 結果・PR イベントをハンドリングする。
+
+**受信イベント**：
+- `workflow_run`（CI 完了）
+- `pull_request`（PR オープン / クローズ）
+
+**処理内容**：
+
+| イベント | アクション |
+|---|---|
+| CI 成功 | State DB を `ci-passed` に更新 |
+| CI 失敗（repair 上限内） | State DB を `ci-failed` に更新 → SQS に repair job を積む |
+| CI 失敗（repair 上限超過） | `needs-human` ラベル付与 + 通知 |
+
+#### 2.1.3 /create コマンド（マルチリポジトリ対応）
+
+`/create <app-name>` 受信時に processor が以下を実行する：
+
+1. GitHub API で新規リポジトリ作成
+2. `dev-agents` のワークフローファイルをコピー
+3. ラベルを一括作成
+4. `CLAUDE_CODE_OAUTH_TOKEN`・`GH_PAT` を Secrets として登録
+5. Actions 権限（PR 作成許可）を有効化
+6. State DB にリポジトリ情報を登録
+
+#### 2.1.4 環境変数
+
+| 変数 | 対象関数 | 内容 |
+|---|---|---|
+| `DISCORD_PUBLIC_KEY` | handler | Discord アプリ公開鍵 |
+| `PROCESSOR_FUNCTION_NAME` | handler | processor の Lambda 関数名 |
+| `GEMMA_API_KEY` | processor | Gemma API キー |
+| `GITHUB_TOKEN` | processor | GitHub PAT |
+| `GITHUB_REPO` | processor | デフォルト Issue 起票先 |
+| `CLAUDE_CODE_OAUTH_TOKEN` | processor | 新リポジトリへの Secret 転写用 |
+| `GH_PAT` | processor | 新リポジトリへの Secret 転写用 |
+| `JOB_QUEUE_URL` | processor | SQS キュー URL |
+| `STATE_TABLE_NAME` | processor / orchestrator | DynamoDB テーブル名 |
+
+#### 2.1.5 エラー処理方針
+
+- Discord トークン期限切れ（404）はエラーを無視・リトライしない
+- processor の Lambda 非同期リトライは 0 回（重複 Issue 起票防止）
+- 曖昧な要求は Issue を起票せず Discord 上で確認
+
+#### 2.1.6 ウォームアップ戦略
+
+Lambda コールドスタートが Discord の3秒制限に近いため、EventBridge で5分ごとに handler を ping してウォーム状態を維持する。
+
+---
+
+### 2.2 GitHub Actions（オーケストレーション層）
+
+**役割をラベルイベント検知と SQS へのジョブ送信に限定する。** 処理時間は数秒以内。
+
+#### 2.2.1 トリガーワークフロー構成
+
+各エージェントに対応するワークフローが `issues: labeled` / `pull_request: labeled` イベントを検知し、SQS にジョブメッセージを送信する。
+
+```yaml
+# 例：requirements-trigger.yml
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  dispatch:
+    if: github.event.label.name == '要件定義作成'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send job to SQS
+        run: |
+          aws sqs send-message \
+            --queue-url ${{ secrets.JOB_QUEUE_URL }} \
+            --message-body '{
+              "job_type": "requirements",
+              "issue_number": "${{ github.event.issue.number }}",
+              "repo": "${{ github.repository }}"
+            }'
+```
+
+#### 2.2.2 CI ワークフロー
+
+```yaml
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+```
+
+PR マージ前検証と main 保護を最低限とする。feature ブランチへの push では起動しない。
+
+**MVP フェーズの CI 構成**：
+
+| フェーズ | CI 内容 |
+|---|---|
+| MVP 初期 | ワークフロー構文チェック（actionlint） |
+| 実装開始後 | リント・型検査 |
+| テスト追加後 | 単体テスト |
+
+---
+
+### 2.3 ECS Fargate Worker（実行層）
+
+Claude Code をネイティブ実行する自律エージェント。ジョブ種別に応じた処理を実行し、完了後に次フェーズへバトンを渡す。
+
+#### 2.3.1 起動フロー
+
+```
+SQS メッセージ受信
+  ↓ EventBridge Pipes
+ECS Fargate タスク起動（ジョブメッセージをパラメータとして受け取る）
+  ↓
+State DB で job_id を in-progress に更新（二重起動防止）
+  ↓
+ジョブ種別に応じた処理を実行
+  ↓
+State DB を completed / failed に更新
+  ↓
+タスク終了（使い捨て）
+```
+
+#### 2.3.2 ジョブ種別と処理内容
+
+| ジョブ種別 | トリガーラベル | Worker の処理 | 次フェーズへの引き渡し |
+|---|---|---|---|
+| `requirements` | 要件定義作成 | Issue・コメント読み込み → LLM で要件整理 → 質問コメント投稿 or 要件確定コメント投稿 | ラベル更新（PAT）で次ジョブ発行 |
+| `design` | 詳細設計作成 | 要件確定コメント読み込み → 設計書生成 → リポジトリにコミット | ラベル更新（PAT） |
+| `task-split` | タスク分割 | 設計書読み込み → 子 Issue 起票 → 各子 Issue に ready-for-impl 付与 | ラベル付与（PAT）→ impl ジョブ発行 |
+| `implement` | ready-for-impl | リポジトリクローン → ブランチ作成 → Claude Code で実装 → コミット → プッシュ → PR 作成 | PR に ready-for-review ラベル付与（PAT） |
+| `repair` | CI 失敗（Orchestrator から） | PR ブランチをクローン → CI 失敗ログ取得 → Claude Code で修正 → コミット → プッシュ | PR に ready-for-review ラベル付与（PAT） |
+
+#### 2.3.3 ラベル更新の PAT 必須理由
+
+GitHub Actions の `GITHUB_TOKEN` によるラベル変更は `labeled` イベントを発火しない（無限ループ防止の仕様）。Worker が PAT を使用してラベルを更新することで、次のトリガーワークフローが正常に発火する。
+
+---
+
+### 2.4 State DB（DynamoDB）
+
+パイプラインの状態を永続管理し、二重起動防止・repair 試行回数管理・観測可能性を提供する。
+
+| 属性 | 型 | 説明 |
+|---|---|---|
+| `job_id` | PK（String） | UUID |
+| `issue_number` | Number | GitHub Issue 番号 |
+| `repo` | String | 対象リポジトリ（例: `haruvv/my-app`） |
+| `job_type` | String | `requirements` / `design` / `task-split` / `implement` / `repair` |
+| `status` | String | `queued` / `in-progress` / `pr-created` / `ci-running` / `ci-passed` / `ci-failed` / `done` / `failed` |
+| `pr_number` | Number | 作成された PR 番号 |
+| `ci_attempt` | Number | CI 試行回数 |
+| `repair_attempt` | Number | repair 試行回数（上限 3） |
+| `created_at` | String | ISO 8601 |
+| `updated_at` | String | ISO 8601 |
+
+---
+
+## 3. パイプラインステート設計
+
+### 3.1 Issue ラベル（ステート遷移）
+
+| ラベル | 意味 | 付与主体 |
+|---|---|---|
+| `要件定義作成` | 要件定義ジョブのトリガー | 人間 / タスク分割 Worker |
+| `in-requirements` | 要件定義 Worker 実行中 | Worker |
+| `waiting-for-answer` | 人間の回答待ち | Worker |
+| `詳細設計作成` | 設計ジョブのトリガー | Worker |
+| `in-design` | 設計 Worker 実行中 | Worker |
+| `タスク分割` | タスク分割ジョブのトリガー | Worker |
+| `in-task-split` | タスク分割 Worker 実行中 | Worker |
+| `ready-for-impl` | 実装ジョブのトリガー | Worker |
+| `in-impl` | 実装 Worker 実行中 | Worker |
+| `blocked` | 自動処理停止・要人間対応 | Worker / Orchestrator |
+| `needs-human` | 上限超過・人間介入必要 | Orchestrator |
+
+### 3.2 PR ラベル
+
+| ラベル | 意味 | 付与主体 |
+|---|---|---|
+| `ai-generated` | Worker が生成した PR | Worker |
+| `ready-for-review` | レビュージョブのトリガー | Worker |
+| `in-review` | レビュー Worker 実行中 | Worker |
+| `needs-fix` | 差し戻し（同一 PR ブランチで修正継続） | Worker |
+| `review-passed` | レビュー承認済み | Worker |
+| `ready-to-merge` | マージ条件を全て満たした | Orchestrator |
+| `auto-merge` | 自動マージ許可 | 人間 |
+| `blocked` | 自動処理停止 | Worker / Orchestrator |
+
+### 3.3 Issue ステートマシン
+
+```
+                        人間が /issue
+                             │
+                             ▼
+                       要件定義作成
+                             │
+              ┌──────────────┤
+              │              │
+         質問あり         質問なし
+              │              │
+      waiting-for-answer   詳細設計作成
+              │              │
+       人間が回答            ▼
+              │          in-design
+       要件定義作成            │
+              │          タスク分割
+              │              │
+              └──────────────┘
+                             │
+                        in-task-split
+                             │
+                    子 Issue × N 起票
+                    各子 Issue に ready-for-impl
+                             │
+                         in-impl
+                             │
+                          PR 作成
+                    ready-for-review (PR)
 ```
 
 ---
 
-## 2. エージェント詳細設計
+## 4. 要件定義・設計フェーズ詳細
 
-### 2.1 要件定義エージェント
+### 4.1 要件定義 Worker
 
-**ワークフロー**：`claude-requirements.yml`  
-**トリガー**：Issue への `要件定義作成` ラベル付与
-
-**処理フロー**：
-1. `blocked` ラベルチェック。付いていればスキップ。
-2. `in-requirements` に遷移（`要件定義作成` を除去、`in-requirements` を付与）。
-3. Claude Code Action を起動。Issue 本文を読み、曖昧点があれば質問コメントを投稿。
-4. 質問あり：`in-requirements` を除去し `waiting-for-answer` を付与して停止。
-5. 質問なし（要件確定）：要件確定コメントを投稿し、`in-requirements` を除去して `詳細設計作成` を付与。
-6. 人間が回答後、`waiting-for-answer` を除去して `要件定義作成` を再付与することで再起動。
-7. 質問ループは最大2往復まで。上限超過時は `blocked` + `needs-human` を付与。
-8. 失敗時：`blocked` を付与しコメントで通知。
-
-**エージェント定義**（`.claude/agents/requirements.md`）に以下を定義：
-- 要件確定コメントのフォーマット
-- 質問ループの上限（最大2往復）
-- `docs/` の参照先
-
-### 2.2 設計エージェント
-
-**ワークフロー**：`claude-design.yml`  
-**トリガー**：Issue への `詳細設計作成` ラベル付与
+**ジョブ種別**：`requirements`  
+**トリガーラベル**：`要件定義作成`
 
 **処理フロー**：
-1. `blocked` ラベルチェック。
-2. `in-design` に遷移（`詳細設計作成` を除去、`in-design` を付与）。
-3. Claude Code Action を起動。Issue の要件確定コメントを読み、設計書を生成して `docs/<issue-number>-design.md` にコミット。
-4. Issue に設計書 URL をコメントし、`in-design` を除去して `タスク分割` を付与。
-5. 失敗時：`blocked` を付与しコメントで通知。
+1. `blocked` チェック。付いていればスキップ。
+2. Issue ラベルを `in-requirements` に遷移。
+3. Issue 本文・コメント履歴を読み込み、LLM で要件整理。
+4. 曖昧点ありかつ質問往復 < 2 の場合：質問コメントを投稿 → `waiting-for-answer` に遷移。
+5. 要件確定できる場合（曖昧点なし、または質問往復 ≥ 2）：要件確定コメントを投稿 → `詳細設計作成` を付与。
+6. 失敗時：`blocked` を付与しコメントで通知。
 
-**設計書に含める内容**：
-- 目的・背景
-- 実装方針
-- 制約条件
-- 作業分割方針
-- 検証方法
+**質問往復上限**：2往復。超過時は現時点の情報で強制確定。
 
-### 2.3 タスク分割エージェント
+### 4.2 設計 Worker
 
-**ワークフロー**：`claude-task-split.yml`  
-**トリガー**：Issue への `タスク分割` ラベル付与
+**ジョブ種別**：`design`  
+**トリガーラベル**：`詳細設計作成`
 
 **処理フロー**：
-1. `blocked` ラベルチェック。
-2. `in-task-split` に遷移（`タスク分割` を除去、`in-task-split` を付与）。
-3. Claude Code Action を起動。`docs/<issue-number>-design.md` を読み、実装可能な粒度（1エージェントが1 PR で完結できる単位）に分割。
-4. 各タスクを子 Issue として起票（親 Issue 参照を本文に含める）。
-5. 各子 Issue に `ready-for-impl` ラベルを付与。
-6. 親 Issue に分割完了コメントを投稿し、`in-task-split` を除去。
-7. 失敗時：`blocked` を付与しコメントで通知。
+1. `blocked` チェック。
+2. `in-design` に遷移。
+3. 要件確定コメントを読み込み、設計書を生成して `docs/<issue-number>-design.md` にコミット。
+4. Issue に設計書 URL をコメント → `タスク分割` を付与。
+5. 失敗時：`blocked` を付与。
 
-**子 Issue テンプレート**：
-```
-## 概要
-（タスクの説明）
+**設計書フォーマット**：
+```markdown
+# 設計書：<タイトル>
 
-## 親 Issue
-#<番号>
-
+## 目的・背景
 ## 実装方針
-（設計書から抜粋）
-
-## 完了条件
-（具体的な完了基準）
+## 制約条件
+## 作業分割方針（タスク分割 Worker への指示）
+## 検証方法
 ```
 
-### 2.4 実装エージェント
+### 4.3 タスク分割 Worker
 
-**ワークフロー**：`claude-impl.yml`  
-**トリガー**：Issue への `ready-for-impl` ラベル付与 / PR への `needs-fix` ラベル付与
-
-**処理フロー（初回実装 / 差し戻し修正 共通）**：
-1. `blocked` ラベルチェック。
-2. Issue トリガーの場合：`in-impl` に遷移（`ready-for-impl` を除去、`in-impl` を付与）し新規ブランチ `impl/issue-<issue-number>-<slug>` を作成。
-3. PR トリガー（`needs-fix`）の場合：PR の `needs-fix` を除去し、関連 Issue に `in-impl` を付与。既存 PR ブランチで修正を継続。
-4. Claude Code Action を起動。実装または修正を実施。
-5. Issue トリガーの場合：PR 作成（`ai-generated` ラベル付与）。
-6. PR に `ready-for-review` ラベルを付与。
-7. `in-impl` を除去。
-8. ブランチ未生成時・失敗時：`blocked` を付与しコメントで通知。
-
-### 2.5 レビューエージェント
-
-**ワークフロー**：`claude-review.yml`  
-**トリガー**：PR への `ready-for-review` ラベル付与
+**ジョブ種別**：`task-split`  
+**トリガーラベル**：`タスク分割`
 
 **処理フロー**：
-1. `blocked` ラベルチェック。
-2. レビュー試行回数チェック（上限3回）。上限超過時は `blocked` + `needs-human` を付与。
-3. `in-review` に遷移（`ready-for-review` を除去、`in-review` を付与）。
-4. Claude Code Action を起動。差分・PR 概要を読み、レビューコメントを投稿。
-5. `ACTION: APPROVE` の場合：`in-review` を除去し `review-passed` を付与。
-6. `ACTION: REQUEST_CHANGES` の場合：`in-review` を除去し、PR に `needs-fix` ラベルを付与する。`needs-fix` が実装エージェントの差し戻しトリガーとなり、同一ブランチ・同一 PR 上で修正が継続される。修正完了後に実装エージェントが `ready-for-review` を付与し、レビューループを継続する。
-7. 判定不能・失敗時：`blocked` を付与しコメントで通知。
+1. `blocked` チェック。
+2. `in-task-split` に遷移。
+3. 設計書の作業分割方針を読み込み、1 Worker が 1 PR で完結できる粒度に分割。
+4. 各タスクを子 Issue として起票（親 Issue 参照を本文に含める）。
+5. 各子 Issue に `ready-for-impl` を付与。
+6. 親 Issue に分割完了コメントを投稿 → `in-task-split` を除去。
+7. 失敗時：`blocked` を付与。
 
-**差し戻し方針**：
-- PR はクローズしない。修正は同一ブランチ・同一 PR 上で行う。
-- Issue は親タスク管理用として維持する。修正ループの主体は PR とする。
-- 差し戻しのトリガーは `needs-fix` ラベルに統一し、実装エージェントが検知して再起動する。
+---
 
-**レビュー結果フォーマット**：
+## 5. 実装・修正フェーズ詳細
+
+### 5.1 実装 Worker
+
+**ジョブ種別**：`implement`  
+**トリガーラベル**：`ready-for-impl`
+
+**処理フロー**：
+1. `blocked` チェック。
+2. Issue に `in-impl` を付与。
+3. 対象リポジトリをクローン。
+4. `impl/issue-<番号>-<slug>` ブランチを作成・プッシュ。
+5. 設計書（`docs/<親issue番号>-design.md`）を参照して Claude Code で実装。
+6. 変更をコミット・プッシュ。
+7. PR を作成（`ai-generated` ラベル付与）。
+8. `ready-for-review` を付与（PAT）→ レビュージョブ発行。
+9. Issue の `in-impl` を除去。
+10. 失敗時：`blocked` を付与。
+
+### 5.2 レビュー Worker
+
+**ジョブ種別**：`review`  
+**トリガーラベル**：`ready-for-review`（PR）
+
+**処理フロー**：
+1. `blocked` チェック。レビュー試行上限（3回）チェック。
+2. `in-review` に遷移。
+3. 差分・PR 概要・設計書を読み込み、レビューコメントを投稿。
+4. `ACTION: APPROVE` → `in-review` を除去、`review-passed` を付与。
+5. `ACTION: REQUEST_CHANGES` → `in-review` を除去、`needs-fix` を付与。
+6. 上限超過 / 判定不能：`blocked` + `needs-human` を付与。
+
+**レビューコメントフォーマット**：
 ```
 ## 🔍 自動レビュー結果
 
@@ -193,409 +427,91 @@ dev-agents/
 ACTION: APPROVE | REQUEST_CHANGES
 ```
 
-### 2.6 統合判定エージェント
+**差し戻し方針**：PR はクローズしない。同一ブランチ・同一 PR 上で修正を継続。
 
-**ワークフロー**：`claude-merge-check.yml`  
-**トリガー**：PR への `review-passed` ラベル付与
+### 5.3 repair Worker
+
+**ジョブ種別**：`repair`  
+**トリガー**：Orchestrator が CI 失敗を検知して SQS に積む
 
 **処理フロー**：
-1. CI 結果を確認（`gh pr checks` で全チェック通過を検証）。
-2. 統合条件（後述 §5）をすべて満たす場合：`ready-to-merge` ラベルを付与。
-3. `auto-merge` ラベルが付いている場合のみ自動マージを実行。
-4. 条件未達の場合：理由をコメントし `blocked` を付与。
-
-### 2.7 監視エージェント
-
-**ワークフロー**：`stale-monitor.yml`  
-**実行スケジュール**：2時間ごと（`cron: '0 */2 * * *'`）
-
-**停滞シグナルと回復アクション**：
-
-| シグナル | 判定基準 | 回復アクション |
-|---|---|---|
-| 更新停滞 | Issue / PR の最終更新から4時間以上経過かつ `in-*` ラベルあり | 下表のラベル対応表に従い `in-*` を除去してトリガーラベルを付け直す |
-| 実行中停滞 | `in-impl` 付与から2時間以上経過かつ PR 未作成 | `in-impl` を除去し `ready-for-impl` を Issue に付け直して再起動 |
-| ループ停滞 | `blocked` → トリガーラベル付与の遷移が同一 Issue / PR で3回以上 | `blocked` + `needs-human` を付与しコメントで通知（自動回復しない） |
-
-**`in-*` ラベルとトリガーラベルの対応表**（更新停滞時の再起動に使用）：
-
-| 検出した `in-*` ラベル | 対象 | 除去するラベル | 付け直すトリガーラベル |
-|---|---|---|---|
-| `in-requirements` | Issue | `in-requirements` | `要件定義作成` |
-| `in-design` | Issue | `in-design` | `詳細設計作成` |
-| `in-task-split` | Issue | `in-task-split` | `タスク分割` |
-| `in-impl` | Issue | `in-impl` | `ready-for-impl` |
-| `in-review` | PR | `in-review` | `ready-for-review` |
-
-**自動回復の上限**：更新停滞・実行中停滞への自動回復は最大2回。以降は `needs-human` に切り替え。
+1. State DB で repair_attempt を確認。上限（3回）超過で `needs-human` に切り替え。
+2. PR ブランチをクローン。
+3. CI 失敗ログを取得（GitHub API）。
+4. Claude Code でエラーを修正・コミット・プッシュ。
+5. State DB を `ci-running` に更新。
+6. GitHub Actions CI が自動再実行される。
 
 ---
 
-## 3. ラベル設計
+## 6. マルチリポジトリ設計
 
-### 3.1 Issue ラベル
-
-| ラベル | 意味 | 付与主体 |
-|---|---|---|
-| `要件定義作成` | 要件定義エージェントのトリガー | 人間 |
-| `in-requirements` | 要件定義エージェント実行中 | 要件定義エージェント |
-| `waiting-for-answer` | 要件定義エージェントが人間の回答待ち | 要件定義エージェント |
-| `詳細設計作成` | 設計エージェントのトリガー | 要件定義エージェント |
-| `in-design` | 設計エージェント実行中 | 設計エージェント |
-| `タスク分割` | タスク分割エージェントのトリガー | 設計エージェント |
-| `in-task-split` | タスク分割エージェント実行中 | タスク分割エージェント |
-| `ready-for-impl` | 実装エージェントのトリガー | タスク分割エージェント / 人間 |
-| `in-impl` | 実装エージェント実行中（Issue に付与） | 実装エージェント |
-| `blocked` | 自動処理停止・要人間対応 | 各エージェント |
-| `needs-human` | 自動回復不可・人間介入必要 | 監視エージェント |
-
-### 3.2 PR ラベル
-
-| ラベル | 意味 | 付与主体 |
-|---|---|---|
-| `ai-generated` | エージェントが生成した PR | 実装エージェント |
-| `ready-for-review` | レビューエージェントのトリガー | 実装エージェント |
-| `in-review` | レビューエージェント実行中 | レビューエージェント |
-| `needs-fix` | 差し戻しトリガー。実装エージェントを同一 PR ブランチで再起動する | レビューエージェント |
-| `review-passed` | レビュー承認済み | レビューエージェント |
-| `ready-to-merge` | 統合条件をすべて満たした | 統合判定エージェント |
-| `auto-merge` | 自動マージを明示的に許可 | 人間 |
-| `blocked` | 自動処理停止・要人間対応 | 各エージェント |
-
----
-
-## 4. docs/ 管理設計
-
-### 4.1 ディレクトリ構造
-
-MVP では最小構成とする。運用を通じて必要に応じて拡張する。
+### 6.1 /create コマンド
 
 ```
-docs/
-├── decisions/
-│   └── YYYY-MM-DD-<topic>.md       # 意思決定ログ
-├── plans/
-│   └── <issue-number>-<title>.md   # 実行計画
-└── <issue-number>-design.md        # 設計エージェントが生成する個別設計書
+Discord: /create <app-name>
+  ↓
+processor:
+  1. gh repo create haruvv/<app-name> --public
+  2. dev-agents のワークフローを取得してプッシュ
+  3. ラベルを一括作成（dev-agents と同一セット）
+  4. CLAUDE_CODE_OAUTH_TOKEN / GH_PAT を Secrets に登録
+  5. Actions 権限（PR 作成許可）を有効化
+  6. State DB にリポジトリを登録
+  7. Discord に完了通知
 ```
 
-### 4.2 意思決定ログのフォーマット
+### 6.2 /issue コマンド（拡張後）
 
-```markdown
-# <決定事項のタイトル>
-
-**日時**：YYYY-MM-DD
-**決定者**：<人間 or エージェント名>
-
-## 背景
-## 選択肢
-## 決定内容
-## 理由
-## 影響範囲
 ```
-
-### 4.3 実行計画のフォーマット
-
-```markdown
-# 実行計画：<Issue タイトル>
-
-**対象 Issue**：#<番号>
-**作成日**：YYYY-MM-DD
-
-## 目的
-## 対象範囲
-## 前提条件
-## 実装方針
-## タスク一覧
-- [ ] タスク1
-## 検証方法
-## リスク・懸念事項
+Discord: /issue [<repo>] <description>
+  ↓
+processor:
+  repo 指定あり → 該当リポジトリに Issue 起票
+  repo 省略    → 登録済みリポジトリ一覧を返信して選択を促す
 ```
 
 ---
 
-## 5. 統合条件設計
+## 7. 統合条件設計
 
 PR のマージは以下の条件をすべて満たした場合にのみ実施する。
 
 | 条件 | 検証方法 |
 |---|---|
 | `review-passed` ラベルが付いている | ラベル存在確認 |
-| CI（lint / test / build）がすべて成功 | `gh pr checks` で全件 `success` 確認 |
+| CI（lint / test）がすべて成功 | `gh pr checks` で全件 success 確認 |
 | `blocked` ラベルが付いていない | ラベル不在確認 |
-| 自動マージ許可（`auto-merge` ラベル）がある場合のみ自動実行 | ラベル存在確認 |
+| `auto-merge` ラベルがある場合のみ自動マージ | ラベル存在確認 |
 
-`auto-merge` ラベルがない場合は `ready-to-merge` ラベルを付与して人間の判断を待つ。
+`auto-merge` がない場合は `ready-to-merge` を付与して人間の判断を待つ。
 
 ---
 
-## 6. CI 設計
+## 8. 観測可能性設計
 
-### 6.1 CI の起動条件
-
-`ci.yml` は以下のイベントでのみ起動する。
-
-```yaml
-on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
-```
-
-PR マージ前の検証（`pull_request`）と main 保護（`push`）を最低限とする。feature ブランチへの push では起動しない。
-
-### 6.2 MVP フェーズの CI 構成
-
-開発の進捗に応じて段階的に有効化する。
-
-| フェーズ | CI 内容 |
+| 手段 | 内容 |
 |---|---|
-| MVP 初期 | ワークフロー定義の構文チェック（`actionlint` 等） |
-| 実装開始後 | リント・型検査 |
-| テスト追加後 | 単体テスト |
-| 必要に応じて | ビルド・結合テスト |
-
-### 6.3 アーキテクチャ制約の CI 強制
-
-要件定義書 §4.4 の不変条件（レイヤ逆流禁止・ドメイン外直接参照禁止等）は、CI で機械的に検証する。コメントや規約文書への記載のみでの管理は不可とする。
+| GitHub Issue / PR コメント | Worker が処理開始・主要アクション・結果・次アクションをコメントとして記録 |
+| State DB | 全ジョブのステータス・試行回数・タイムスタンプを管理 |
+| GitHub Actions ログ | トリガー検知・SQS 送信の記録 |
+| ECS タスクログ | Worker の実行ログ（CloudWatch Logs） |
+| CI 結果 | GitHub Checks API |
 
 ---
 
-## 7. 観測可能性設計
+## 9. 移行フェーズ
 
-### 7.1 MVP で実現する観測手段
-
-- **CI 結果**：GitHub Actions ログ・Checks API
-- **テスト結果**：Actions Artifact に保存
-- **エージェントの行動ログ**：各エージェントが Issue / PR にコメントとして残す（処理開始・主要アクション・結果・次のアクション）
-
-### 7.2 将来拡張
-
-要件定義書 §4.5 に従い、アプリケーションログ・メトリクス・トレース・UI確認手段への拡張を想定する。MVP では着手しない。
-
----
-
-## 8. 非機能要件の実現方針
-
-| 非機能要件 | 実現方針 |
-|---|---|
-| 再現性（§7.1） | 決定論的な CI（同一入力・同一検証結果）で保証 |
-| 可観測性（§7.2） | Issue / PR コメントへのエージェント行動ログ記録 |
-| 分割可能性（§7.3） | タスク分割エージェントによる子 Issue 単位への分割 |
-| エスカレーション可能性（§7.4） | `blocked` / `needs-human` ラベルによる人間への引き渡し |
-
----
-
-## 9. MVP 実装優先順位
-
-要件定義書 §8.1 の目標に対する **実装順序**（運用時の起動順序ではない）。  
-最小ループを早期に稼働させることを優先し、上流エージェントは後から追加していく。
-
-| 優先度 | 対象 | 理由 |
+| フェーズ | 内容 | 状態 |
 |---|---|---|
-| 1 | 実装エージェント | Issue → PR の最小ループの核 |
-| 2 | レビューエージェント | PR → 承認 / 差し戻しの自律化 |
-| 3 | CI | 決定論的ガードレールの基盤 |
-| 4 | 統合判定エージェント | マージ直前までの自律化 |
-| 5 | 監視エージェント | 停滞検知・自動回復 |
-| 6 | タスク分割エージェント | Issue 分割の自律化 |
-| 7 | 設計エージェント | docs/ への設計書自動生成 |
-| 8 | 要件定義エージェント | Issue 上での要件確定の自律化 |
+| フェーズ1 | GitHub Actions のみでパイプライン動作確認（dev-agents-sandbox） | 完了（v1 検証） |
+| フェーズ2 | ECS Fargate Worker 実装・GitHub Actions はトリガーのみに変更 | 次のステップ |
+| フェーズ3 | Orchestrator に Webhook エンドポイント追加・State DB 構築 | 未着手 |
+| フェーズ4 | `/create` コマンド実装・マルチリポジトリ対応 | 未着手 |
 
 ---
 
-## 10. agent-intake 設計
-
-### 10.1 概要
-
-agent-intake は、Discord ボットとして動作する要求受付層。人間が自然言語で入力した要求を LLM で解釈し、GitHub Issue を自動起票して dev-agents パイプラインへ引き渡す。
-
-**リポジトリ**：`haruvv/agent-intake`
-
-### 10.2 アーキテクチャ
-
-```
-Discord
-  │ POST /interactions
-  ▼
-API Gateway（HTTP API）
-  │
-  ▼
-Lambda: agent-intake-handler
-  │ 署名検証（Ed25519 / PyNaCl）
-  │ type 1 → PONG（即時返答）
-  │ type 2 → type 5 ACK 即時返答（「処理中...」表示）
-  │          ＋ processor を非同期起動（InvocationType='Event'）
-  ▼
-Lambda: agent-intake-processor
-  │ Gemini / Gemma API で自然言語を解釈
-  │ 曖昧な場合 → Discord に確認メッセージを返信（PATCH /messages/@original）
-  │ 明確な場合 → GitHub API で Issue 起票（「要件定義作成」ラベル付与）
-  └→ Discord に結果を返信（Issue URL を通知）
-```
-
-### 10.3 2 関数構成の理由
-
-Discord はインタラクション受信から 3 秒以内の ACK を要求する。LLM 推論と GitHub API 呼び出しを合わせると数十秒かかるため、handler と processor を分離して非同期化する設計とする。
-
-| 関数 | 役割 | タイムアウト |
-|---|---|---|
-| `agent-intake-handler` | 署名検証・即時 ACK・processor 非同期起動 | 3 秒以内に応答 |
-| `agent-intake-processor` | LLM 解釈・Issue 起票・Discord 返信 | 最大 30 秒 |
-
-### 10.4 ウォームアップ戦略
-
-Lambda コールドスタートが Discord の 3 秒制限に近いため、EventBridge で 5 分ごとに handler を ping してウォームアップを維持する。
-
-### 10.5 環境変数
-
-| 変数 | 対象関数 | 内容 |
-|---|---|---|
-| `DISCORD_PUBLIC_KEY` | handler | Discord アプリの公開鍵（署名検証用） |
-| `PROCESSOR_FUNCTION_NAME` | handler | processor の Lambda 関数名 |
-| `GEMINI_API_KEY` | processor | Gemini / Gemma API キー |
-| `GITHUB_TOKEN` | processor | GitHub Personal Access Token |
-| `GITHUB_REPO` | processor | Issue 起票先リポジトリ（例：`haruvv/dev-agents`） |
-
-### 10.6 エラー処理方針
-
-- Discord のインタラクショントークンが期限切れ（404）の場合、エラーは無視してリトライしない
-- processor の Lambda 非同期リトライは 0 回に設定（重複 Issue 起票を防ぐ）
-- 曖昧な要求は Issue を起票せず Discord 上で確認を求める
-
----
-
-## 11. 次世代アーキテクチャ設計（v2）
-
-現行MVPの検証を通じて、GitHub Actions内でのエージェント実行には構造的な限界があることが判明した。本セクションは次世代アーキテクチャの設計方針を定義する。
-
-### 11.1 設計思想の転換
-
-**現行（v1）の問題**：
-- GitHub Actions の `claude-code-base-action` はツール権限・ブランチ操作・タイムアウト等の制約が多い
-- `GITHUB_TOKEN` によるラベル変更はイベントを発火しないため PAT による回避が必要
-- Actions はトリガーとしての用途に適しているが、長時間の自律実行には不向き
-
-**v2 の方針**：GitHub Actions はトリガーと CI に限定し、実装・修正などの重処理は外部 Worker に委譲する。
-
-### 11.2 全体フロー
-
-```
-Discord
-  ↓ /issue, /create コマンド
-Lambda（agent-intake）
-  ↓ LLM（Gemma）で自然言語解釈
-GitHub Issue 起票 + ready-for-impl ラベル付与
-  ↓ issues: labeled イベント
-GitHub Actions（トリガー専用・軽量）
-  ↓ SQS にジョブメッセージを送信
-SQS
-  ↓ EventBridge Pipes
-ECS Fargate Worker（実装・コミット・PR作成）
-  ↓ PR 作成
-GitHub Actions（CI: lint / test / type check）
-  ↓ 成功 / 失敗
-GitHub Webhook
-  ↓ /webhook エンドポイント
-agent-intake / Orchestrator
-  ↓ State DB 更新
-  ├─ CI 成功 → 人間レビュー待ち
-  └─ CI 失敗 → SQS に repair job を積む
-        ↓
-     ECS Fargate Worker（修正・再コミット）
-        ↓
-     GitHub Actions（CI 再実行）
-        ↓（成功まで繰り返し、上限に達したら人間エスカレーション）
-人間レビュー
-  ↓ approve
-マージ
-```
-
-### 11.3 コンポーネント設計
-
-#### GitHub Actions（トリガー層）
-
-役割をラベルイベント検知と SQS 送信に限定する。処理時間は数秒以内。
-
-```yaml
-- name: Send job to SQS
-  run: |
-    aws sqs send-message \
-      --queue-url ${{ secrets.JOB_QUEUE_URL }} \
-      --message-body '{
-        "job_type": "implement",
-        "issue_number": "${{ github.event.issue.number }}",
-        "repo": "${{ github.repository }}",
-        "label": "${{ github.event.label.name }}"
-      }'
-```
-
-#### ECS Fargate Worker
-
-Claude Code をネイティブ実行する自律エージェント。タスクは以下の責務を持つ：
-
-- SQS からジョブを受け取り State DB で `in-progress` に更新（二重起動防止）
-- 対象リポジトリをクローン、実装ブランチを作成
-- Claude Code で実装・コミット・プッシュ
-- PR 作成 + 適切なラベル付与（PAT を使用）
-- 完了後 State DB を `pr-created` に更新
-
-#### Orchestrator（agent-intake 拡張）
-
-GitHub Webhook の `/webhook` エンドポイントを追加し、CI 結果をハンドリングする。
-
-```
-受信イベント:
-  - workflow_run (CI 完了)
-  - pull_request (PR オープン / クローズ)
-
-処理:
-  - State DB のステータス更新
-  - CI 失敗時 → repair job を SQS に積む
-  - repair 試行上限（デフォルト 3 回）超過 → needs-human ラベル付与 + Slack 通知
-```
-
-#### State DB（DynamoDB）
-
-| 属性 | 型 | 説明 |
-|---|---|---|
-| `job_id` | PK（String） | UUID |
-| `issue_number` | Number | GitHub Issue 番号 |
-| `repo` | String | 対象リポジトリ（例: `haruvv/my-app`） |
-| `status` | String | `queued` / `in-progress` / `pr-created` / `ci-running` / `ci-failed` / `done` / `failed` |
-| `pr_number` | Number | 作成された PR 番号 |
-| `ci_attempt` | Number | CI 試行回数 |
-| `repair_attempt` | Number | repair 試行回数 |
-| `created_at` | String | ISO 8601 |
-| `updated_at` | String | ISO 8601 |
-
-### 11.4 マルチリポジトリ対応（/create コマンド）
-
-v2 では実装先リポジトリを動的に指定できる設計とする。
-
-**`/create <app-name>`**：
-1. GitHub API で新規リポジトリ作成
-2. `dev-agents` のワークフローテンプレートをコピー
-3. ラベル・Secrets・Actions 権限を自動セットアップ
-4. State DB にリポジトリ情報を登録
-
-**`/issue [<repo>] <description>`**：
-- `repo` を省略した場合は登録済みリポジトリ一覧から選択
-- 指定リポジトリに Issue 起票 → Worker が該当リポジトリで実装
-
-### 11.5 v1 → v2 移行方針
-
-| フェーズ | 内容 |
-|---|---|
-| フェーズ1（現在） | GitHub Actions でパイプライン動作確認（dev-agents-sandbox） |
-| フェーズ2 | ECS Fargate Worker を実装・GitHub Actions はトリガーのみに変更 |
-| フェーズ3 | Orchestrator に Webhook エンドポイント追加・State DB 構築 |
-| フェーズ4 | `/create` コマンド実装・マルチリポジトリ対応 |
-
----
-
-## 12. 制約一覧（dev-agents）
+## 10. 制約一覧
 
 | 制約 | 内容 |
 |---|---|
@@ -603,5 +519,5 @@ v2 では実装先リポジトリを動的に指定できる設計とする。
 | blocked の遵守 | `blocked` ラベルを無視した処理続行は禁止 |
 | 秘密情報の禁止 | API キー・トークン等をコードやコミットに含めない |
 | 自動マージ制限 | `auto-merge` ラベルの明示的付与なしに自動マージしない |
-| 再試行上限 | 各エージェントの再試行は上限を設け、無制限な試行を禁止する |
-| アーキテクチャ制約の CI 強制 | レイヤ逆流・ドメイン外直接参照等はコメントではなく CI で強制する |
+| 再試行上限 | 各 Worker の再試行は上限を設け、無制限な試行を禁止する |
+| ラベル付与は PAT で行う | Worker・Orchestrator からのラベル変更は PAT を使用し、イベント発火を保証する |
