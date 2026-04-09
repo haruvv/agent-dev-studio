@@ -1,44 +1,48 @@
-# Claude Code 作業指針（パイプライン開発）
+# Claude Code 作業指針
 
-このリポジトリは `ai-agent-pipeline` の開発・設計を行うワークスペース。
+このリポジトリは自律エージェント基盤の設計・開発を行うワークスペース。
 Claude Code CLI としての私がこのドキュメントを読む。
+
+## ビジョン
+
+OpenClaw をチャットに常駐させ、あらゆるタスクを受け取り、特化エージェントに委譲するプラットフォームを構築する。
+開発・コンサル・顧客調整など業務の種類を問わず、同一のチャットインターフェースから操作できることを目指す。
+
+設計の詳細は `docs/v2/design.md` を参照。
 
 ## リポジトリ構成
 
 | リポジトリ | 役割 |
 |-----------|------|
-| `haruvv/agent-dev-studio` | このワークスペース。設計・開発の作業場 |
-| `haruvv/ai-agent-pipeline` | Reusable Workflow の定義・スクリプト管理 |
-| `haruvv/ai-agent-sandbox` | pipeline の動作確認環境 |
+| `haruvv/agent-dev-studio` | このワークスペース。設計・ドキュメント管理 |
+| `haruvv/openclaw-gateway` | OpenClaw 設定・カスタムツール（チャット常駐ゲートウェイ） |
+| `haruvv/openclaw-dev` | 開発エージェント（Claude Code + GitHub Actions） |
+
+## ドキュメント構成
+
+| パス | 内容 |
+|------|------|
+| `docs/v2/` | 現行設計（v2） |
+| `docs/v1/` | 旧設計（参照のみ） |
 
 ## 作業方針
 
-- 変更は基本的に `ai-agent-pipeline` に対して行う
-- 変更後は `ai-agent-sandbox` で動作確認する
-- pipeline の Reusable Workflow を変更したら sandbox でテストしてから完了とする
+- 設計書・ドキュメントは `docs/v2/` で管理する
+- 実装判断に迷ったら `docs/v2/design.md` を先に参照する
+- v1 の実装・設計を引きずらない。v2 は白紙から設計している
 
-## pipeline の構成
+## 実装時のスキル使用ルール
 
-```
-ai-agent-pipeline/
-├── .github/workflows/
-│   ├── claude-impl-reusable.yml  # Claude実装ワークフローの本体
-│   ├── ci-reusable.yml           # CIの本体
-│   └── ci.yml                    # pipeline自身のPR用CI
-└── scripts/
-    └── setup-repo.sh             # 新リポジトリのセットアップ
-```
+実装タスクに着手する前に、以下のスキルを状況に応じて **能動的に** 使用すること。
 
-## 新しいプロダクトリポジトリを作る手順
+| スキル | 使用タイミング |
+|--------|---------------|
+| `spec-driven-development` | 仕様・要件が曖昧なまま実装を始めようとしているとき |
+| `planning-and-task-breakdown` | 複数ファイルにまたがる・工数が大きいタスクに着手するとき |
+| `test-driven-development` | ロジック実装・バグ修正・振る舞いの変更を行うとき |
+| `incremental-implementation` | 2ファイル以上を変更する実装を行うとき |
+| `api-and-interface-design` | API・モジュール境界・公開インターフェースを設計・変更するとき |
+| `code-review-and-quality` | 変更をマージ・PR 作成する前 |
+| `security-and-hardening` | ユーザー入力・認証・外部 API 連携・データ保存を扱う実装のとき |
 
-```bash
-gh repo create <repo-name> --public --template haruvv/ai-agent-pipeline
-bash /path/to/ai-agent-pipeline/scripts/setup-repo.sh haruvv/<repo-name>
-gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo haruvv/<repo-name>
-```
-
-## 注意事項
-
-- `ai-agent-pipeline` の Reusable Workflow を変更する場合、後方互換性に注意する
-- sandbox で確認せずに pipeline の main を変更しない
-- 秘密情報（APIキー・トークン等）をコードやコミットに含めない
+ユーザーから明示的に「スキルを使うな」と言われた場合のみ省略する。
