@@ -1,0 +1,5 @@
+.DS_Store
+m.txt
+.claude/settings.local.json
+.serena/project.local.yml
+.serena/memories/
